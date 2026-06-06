@@ -1,6 +1,6 @@
 # CanvasGLSL
 
-Replace Minecraft's menu backgrounds with custom GLSL shaders. Includes a built-in shader editor with syntax highlighting.
+ fork of https://github.com/tinywifi/CanvasGLSL  by tinytask
 
 ## Features
 
