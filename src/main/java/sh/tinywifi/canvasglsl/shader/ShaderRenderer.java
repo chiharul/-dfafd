@@ -44,6 +44,12 @@ public class ShaderRenderer {
     private int vertexShader = -1;
     private int fragmentShader = -1;
 
+    // Multi-buffer support
+    private int bufferAProgram = -1;
+    private int bufferBProgram = -1;
+    private BufferChain bufferChain;
+    private ShaderConfig shaderConfig;
+
     private int timeUniform = -1;
     private int resolutionUniform = -1;
     private int mouseUniform = -1;
@@ -94,6 +100,10 @@ public class ShaderRenderer {
         this.startTimeNanos = System.nanoTime();
     }
 
+    public void setShaderConfig(ShaderConfig config) {
+        this.shaderConfig = config;
+    }
+
     public void ensureInitialized() {
         if (glResourcesInitialized) {
             return;
@@ -103,6 +113,9 @@ public class ShaderRenderer {
         initializeChannelTextures();
         if (canvas == null) {
             canvas = new ShaderCanvas();
+        }
+        if (bufferChain == null) {
+            bufferChain = new BufferChain();
         }
         glResourcesInitialized = true;
     }
@@ -124,7 +137,6 @@ public class ShaderRenderer {
             channelHeights[i] = size;
 
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, channelTextures[i]);
-            // Use LINEAR_MIPMAP_LINEAR for better quality when textures are viewed at different scales
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_REPEAT);
@@ -174,7 +186,6 @@ public class ShaderRenderer {
             data.flip();
 
             GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8, size, size, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, data);
-            // Generate mipmaps for better texture quality
             GL30.glGenerateMipmap(GL11.GL_TEXTURE_2D);
         }
 
@@ -189,22 +200,24 @@ public class ShaderRenderer {
         RenderSystem.assertOnRenderThread();
         ensureInitialized();
         cleanupShader();
-        hasLoggedCompilationError = false; // Reset flag for new compilation attempt
+        hasLoggedCompilationError = false;
 
         try {
-            // Patch shaders for compatibility
+            // Check if we have multi-buffer shaders
+            if (shaderConfig != null && shaderConfig.hasValidConfig()) {
+                return compileMultiBuffer();
+            }
+
+            // Single shader mode
             String processedVertex = ShaderPatcher.patchVertex(vertexSource);
             String processedFragment = ShaderPatcher.patchFragment(fragmentSource);
 
-            // Compile vertex shader
             vertexShader = compileShaderPart(processedVertex, GL20.GL_VERTEX_SHADER);
             if (vertexShader == -1) return false;
 
-            // Compile fragment shader
             fragmentShader = compileShaderPart(processedFragment, GL20.GL_FRAGMENT_SHADER);
             if (fragmentShader == -1) return false;
 
-            // Link program
             shaderProgram = GL20.glCreateProgram();
             GL20.glAttachShader(shaderProgram, vertexShader);
             GL20.glAttachShader(shaderProgram, fragmentShader);
@@ -216,44 +229,158 @@ public class ShaderRenderer {
                 return false;
             }
 
-            // Free now unused resources
             GL20.glDeleteShader(vertexShader);
             GL20.glDeleteShader(fragmentShader);
             vertexShader = -1;
             fragmentShader = -1;
 
-            // Get uniform locations
-            timeUniform = GL20.glGetUniformLocation(shaderProgram, "time");
-            resolutionUniform = GL20.glGetUniformLocation(shaderProgram, "resolution");
-            mouseUniform = GL20.glGetUniformLocation(shaderProgram, "mouse");
-            frameUniform = GL20.glGetUniformLocation(shaderProgram, "frame");
-            persistentFrameUniform = GL20.glGetUniformLocation(shaderProgram, "persistent_frame");
-            speedUniform = GL20.glGetUniformLocation(shaderProgram, "speed");
-            iTimeUniform = GL20.glGetUniformLocation(shaderProgram, "iTime");
-            iResolutionUniform = GL20.glGetUniformLocation(shaderProgram, "iResolution");
-            iMouseUniform = GL20.glGetUniformLocation(shaderProgram, "iMouse");
-            iFrameUniform = GL20.glGetUniformLocation(shaderProgram, "iFrame");
-            iTimeDeltaUniform = GL20.glGetUniformLocation(shaderProgram, "iTimeDelta");
-            iDateUniform = GL20.glGetUniformLocation(shaderProgram, "iDate");
-            iSampleRateUniform = GL20.glGetUniformLocation(shaderProgram, "iSampleRate");
-            for (int i = 0; i < channelUniforms.length; i++) {
-                channelUniforms[i] = -1;
-                channelResolutionUniforms[i] = -1;
-                channelTimeUniforms[i] = -1;
-            }
-            for (int i = 0; i < channelUniforms.length; i++) {
-                channelUniforms[i] = GL20.glGetUniformLocation(shaderProgram, "iChannel" + i);
-                channelResolutionUniforms[i] = GL20.glGetUniformLocation(shaderProgram, "iChannelResolution[" + i + "]");
-                channelTimeUniforms[i] = GL20.glGetUniformLocation(shaderProgram, "iChannelTime[" + i + "]");
-            }
-
-            CanvasGLSL.LOG.info("Shader compiled successfully");
+            setupUniforms(shaderProgram);
+            CanvasGLSL.LOG.info("Shader compiled successfully (single buffer mode)");
             return true;
 
         } catch (Exception e) {
             CanvasGLSL.LOG.error("Failed to compile shader", e);
             cleanupShader();
             return false;
+        }
+    }
+
+    /**
+     * Compiles all shaders in the buffer chain.
+     */
+    /**
+     * Compiles all shaders in the buffer chain.
+     */
+    private boolean compileMultiBuffer() {
+        String commonCode = shaderConfig.getCommonShader();
+        String imageCode = shaderConfig.getImageShader();
+        String bufferACode = shaderConfig.getBufferA();
+        String bufferBCode = shaderConfig.getBufferB();
+
+        System.out.println("[ShaderRenderer] Compiling multi-buffer shaders");
+        System.out.println("  - Image: " + (imageCode.isEmpty() ? "EMPTY" : imageCode.length() + " bytes"));
+        System.out.println("  - BufferA: " + (bufferACode.isEmpty() ? "EMPTY" : bufferACode.length() + " bytes"));
+        System.out.println("  - BufferB: " + (bufferBCode.isEmpty() ? "EMPTY" : bufferBCode.length() + " bytes"));
+        System.out.println("  - Common: " + (commonCode.isEmpty() ? "EMPTY" : commonCode.length() + " bytes"));
+
+        // If we only have image shader, compile it directly (no buffer chain)
+        if (!imageCode.isEmpty() && bufferACode.isEmpty() && bufferBCode.isEmpty()) {
+            System.out.println("[ShaderRenderer] Single image shader detected, compiling directly");
+            String fullCode = commonCode + "\n" + imageCode;
+            shaderProgram = compileProgram(fullCode);
+            if (shaderProgram == -1) {
+                CanvasGLSL.LOG.error("Failed to compile image shader");
+                return false;
+            }
+            setupUniforms(shaderProgram);
+            CanvasGLSL.LOG.info("Image shader compiled successfully");
+            return true;
+        }
+
+        // Compile bufferA if it exists
+        if (!bufferACode.isEmpty()) {
+            System.out.println("[ShaderRenderer] Compiling bufferA");
+            String fullCode = commonCode + "\n" + bufferACode;
+            bufferAProgram = compileProgram(fullCode);
+            if (bufferAProgram == -1) {
+                CanvasGLSL.LOG.error("Failed to compile bufferA");
+                return false;
+            }
+            System.out.println("[ShaderRenderer] BufferA compiled successfully");
+        }
+
+        // Compile bufferB if it exists
+        if (!bufferBCode.isEmpty()) {
+            System.out.println("[ShaderRenderer] Compiling bufferB");
+            String fullCode = commonCode + "\n" + bufferBCode;
+            bufferBProgram = compileProgram(fullCode);
+            if (bufferBProgram == -1) {
+                CanvasGLSL.LOG.error("Failed to compile bufferB");
+                return false;
+            }
+            System.out.println("[ShaderRenderer] BufferB compiled successfully");
+        }
+
+        // Compile image shader
+        if (!imageCode.isEmpty()) {
+            System.out.println("[ShaderRenderer] Compiling image shader");
+            String fullCode = commonCode + "\n" + imageCode;
+            shaderProgram = compileProgram(fullCode);
+            if (shaderProgram == -1) {
+                CanvasGLSL.LOG.error("Failed to compile image shader");
+                return false;
+            }
+            System.out.println("[ShaderRenderer] Image shader compiled successfully");
+        }
+
+        setupUniforms(shaderProgram);
+        CanvasGLSL.LOG.info("Multi-buffer shaders compiled successfully");
+        return true;
+    }
+
+    /**
+     * Compiles a single shader program.
+     */
+    /**
+     * Compiles a single shader program.
+     */
+    private int compileProgram(String fragmentSource) {
+        String processedVertex = ShaderPatcher.patchVertex(DEFAULT_VERTEX_SHADER);
+        String processedFragment = ShaderPatcher.patchFragment(fragmentSource);
+
+        int vShader = compileShaderPart(processedVertex, GL20.GL_VERTEX_SHADER);
+        if (vShader == -1) {
+            System.err.println("[ShaderRenderer] Failed to compile vertex shader");
+            return -1;
+        }
+
+        int fShader = compileShaderPart(processedFragment, GL20.GL_FRAGMENT_SHADER);
+        if (fShader == -1) {
+            System.err.println("[ShaderRenderer] Failed to compile fragment shader");
+            GL20.glDeleteShader(vShader);
+            return -1;
+        }
+
+        int program = GL20.glCreateProgram();
+        GL20.glAttachShader(program, vShader);
+        GL20.glAttachShader(program, fShader);
+        GL20.glLinkProgram(program);
+
+        if (GL20.glGetProgrami(program, GL20.GL_LINK_STATUS) == GL11.GL_FALSE) {
+            String log = GL20.glGetProgramInfoLog(program, 1024);
+            System.err.println("[ShaderRenderer] Failed to link shader program: " + log);
+            CanvasGLSL.LOG.error("Failed to link shader program: {}", log);
+            GL20.glDeleteProgram(program);
+            GL20.glDeleteShader(vShader);
+            GL20.glDeleteShader(fShader);
+            return -1;
+        }
+
+        GL20.glDeleteShader(vShader);
+        GL20.glDeleteShader(fShader);
+        System.out.println("[ShaderRenderer] Program compiled successfully: " + program);
+        return program;
+    }
+
+    private void setupUniforms(int program) {
+        timeUniform = GL20.glGetUniformLocation(program, "time");
+        resolutionUniform = GL20.glGetUniformLocation(program, "resolution");
+        mouseUniform = GL20.glGetUniformLocation(program, "mouse");
+        frameUniform = GL20.glGetUniformLocation(program, "frame");
+        persistentFrameUniform = GL20.glGetUniformLocation(program, "persistent_frame");
+        speedUniform = GL20.glGetUniformLocation(program, "speed");
+        iTimeUniform = GL20.glGetUniformLocation(program, "iTime");
+        iResolutionUniform = GL20.glGetUniformLocation(program, "iResolution");
+        iMouseUniform = GL20.glGetUniformLocation(program, "iMouse");
+        iFrameUniform = GL20.glGetUniformLocation(program, "iFrame");
+        iTimeDeltaUniform = GL20.glGetUniformLocation(program, "iTimeDelta");
+        iDateUniform = GL20.glGetUniformLocation(program, "iDate");
+        iSampleRateUniform = GL20.glGetUniformLocation(program, "iSampleRate");
+
+        for (int i = 0; i < channelUniforms.length; i++) {
+            channelUniforms[i] = GL20.glGetUniformLocation(program, "iChannel" + i);
+            channelResolutionUniforms[i] = GL20.glGetUniformLocation(program, "iChannelResolution[" + i + "]");
+            channelTimeUniforms[i] = GL20.glGetUniformLocation(program, "iChannelTime[" + i + "]");
         }
     }
 
@@ -266,7 +393,6 @@ public class ShaderRenderer {
             String log = GL20.glGetShaderInfoLog(shader, 1024);
             String shaderType = (type == GL20.GL_VERTEX_SHADER) ? "vertex" : "fragment";
 
-            // Only log once per compilation attempt (prevent spam)
             if (!hasLoggedCompilationError) {
                 CanvasGLSL.LOG.error("Failed to compile {} shader! Caused by: {}", shaderType, log);
                 hasLoggedCompilationError = true;
@@ -280,16 +406,9 @@ public class ShaderRenderer {
     public void render(int width, int height, float alpha, double quality) {
         RenderSystem.assertOnRenderThread();
         ensureInitialized();
+
         if (shaderProgram == -1) {
             CanvasGLSL.LOG.error("Render called but shader program is not compiled!");
-            return;
-        }
-        if (canvas == null) {
-            CanvasGLSL.LOG.error("Render called but shader canvas is not available!");
-            return;
-        }
-        if (quad == null) {
-            CanvasGLSL.LOG.error("Render called but quad buffer is not initialized!");
             return;
         }
 
@@ -346,7 +465,6 @@ public class ShaderRenderer {
         int prevBlendEqRgb = GL11.glGetInteger(GL_BLEND_EQUATION_RGB);
         int prevBlendEqAlpha = GL11.glGetInteger(GL_BLEND_EQUATION_ALPHA);
 
-        // Save additional state that complex shaders might modify
         int prevActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevVAO = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
@@ -354,11 +472,9 @@ public class ShaderRenderer {
         int prevArrayBuffer = GL15.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
 
         canvas.resize(targetWidth, targetHeight);
-        canvas.write();
-        GL11.glViewport(0, 0, targetWidth, targetHeight);
+        bufferChain.initialize(targetWidth, targetHeight);
 
         try {
-            // Disable depth test, scissor and enable blending for fullscreen quad
             GL11.glDisable(GL11.GL_DEPTH_TEST);
             GL11.glDepthMask(false);
             GL11.glEnable(GL11.GL_BLEND);
@@ -372,10 +488,33 @@ public class ShaderRenderer {
                 GL11.glDisable(GL30.GL_FRAMEBUFFER_SRGB);
             }
 
-            GL20.glUseProgram(shaderProgram);
-
             long nowNanos = System.nanoTime();
             float currentTime = (nowNanos - startTimeNanos) / 1_000_000_000f;
+
+            // Set time for buffer chain
+            bufferChain.setTime(currentTime, (int) frameCounter);
+
+            // Render buffer chain if available
+// Bind iChannel0 - bufferA output (if exists)
+            if (bufferAProgram != -1) {
+                int bufferATexture = bufferChain.getBufferTexture("bufferA");
+                System.out.println("[ShaderRenderer] BufferA texture ID: " + bufferATexture);
+                if (bufferATexture >= 0 && channelUniforms[0] != -1) {
+                    GL13.glActiveTexture(GL13.GL_TEXTURE0);
+                    GL11.glBindTexture(GL11.GL_TEXTURE_2D, bufferATexture);
+                    GL20.glUniform1i(channelUniforms[0], 0);
+                    System.out.println("[ShaderRenderer] Bound bufferA to iChannel0");
+                } else {
+                    System.out.println("[ShaderRenderer] Failed to bind bufferA: texture=" + bufferATexture + ", uniform=" + (channelUniforms[0]));
+                }
+            }
+
+            // Render final image to canvas
+            canvas.write();
+            GL11.glViewport(0, 0, targetWidth, targetHeight);
+
+            GL20.glUseProgram(shaderProgram);
+
             if (timeUniform != -1) {
                 GL20.glUniform1f(timeUniform, currentTime);
             }
@@ -439,30 +578,48 @@ public class ShaderRenderer {
                 GL20.glUniform1f(speedUniform, resolvePanoramaSpeed());
             }
 
-            // Calculate time delta for iTimeDelta uniform
             float timeDelta = lastFrameNanos > 0 ? (nowNanos - lastFrameNanos) / 1_000_000_000f : 0.0f;
             lastFrameNanos = nowNanos;
             if (iTimeDeltaUniform != -1) {
                 GL20.glUniform1f(iTimeDeltaUniform, timeDelta);
             }
 
-            // Set iDate uniform (year, month [0-11], day, time in seconds)
             if (iDateUniform != -1) {
                 java.time.LocalDateTime now = java.time.LocalDateTime.now();
                 float timeOfDay = now.getHour() * 3600f + now.getMinute() * 60f + now.getSecond() + now.getNano() / 1_000_000_000f;
                 GL20.glUniform4f(iDateUniform,
                     now.getYear(),
-                    now.getMonthValue() - 1,  // Shadertoy uses 0-11 for months
+                    now.getMonthValue() - 1,
                     now.getDayOfMonth(),
                     timeOfDay);
             }
 
-            // Set iSampleRate uniform (standard audio sample rate)
             if (iSampleRateUniform != -1) {
                 GL20.glUniform1f(iSampleRateUniform, 44100.0f);
             }
 
-            for (int channel = 0; channel < channelUniforms.length; channel++) {
+            // Bind iChannel0 - bufferA output (if exists)
+            if (bufferAProgram != -1) {
+                int bufferATexture = bufferChain.getBufferTexture("bufferA");
+                if (bufferATexture >= 0 && channelUniforms[0] != -1) {
+                    GL13.glActiveTexture(GL13.GL_TEXTURE0);
+                    GL11.glBindTexture(GL11.GL_TEXTURE_2D, bufferATexture);
+                    GL20.glUniform1i(channelUniforms[0], 0);
+                }
+            }
+
+            // Bind iChannel1 - bufferB output (if exists)
+            if (bufferBProgram != -1) {
+                int bufferBTexture = bufferChain.getBufferTexture("bufferB");
+                if (bufferBTexture >= 0 && channelUniforms[1] != -1) {
+                    GL13.glActiveTexture(GL13.GL_TEXTURE1);
+                    GL11.glBindTexture(GL11.GL_TEXTURE_2D, bufferBTexture);
+                    GL20.glUniform1i(channelUniforms[1], 1);
+                }
+            }
+
+            // Bind pre-generated noise textures to remaining channels
+            for (int channel = 2; channel < channelUniforms.length; channel++) {
                 if (channelUniforms[channel] != -1 && channelTextures[channel] != 0) {
                     GL13.glActiveTexture(GL13.GL_TEXTURE0 + channel);
                     GL11.glBindTexture(GL11.GL_TEXTURE_2D, channelTextures[channel]);
@@ -483,12 +640,6 @@ public class ShaderRenderer {
                 }
             }
 
-            if (backbufferUniform != -1) {
-                GL13.glActiveTexture(GL13.GL_TEXTURE0 + 4);
-                canvas.read();
-                GL20.glUniform1i(backbufferUniform, 4);
-            }
-
             GL13.glActiveTexture(GL13.GL_TEXTURE0);
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
 
@@ -502,16 +653,13 @@ public class ShaderRenderer {
         } catch (Exception e) {
             CanvasGLSL.LOG.error("Error during shader rendering", e);
         } finally {
-            // Restore framebuffer and blit first
             if (canvas != null) {
                 canvas.restore();
                 canvas.blit(alpha);
             }
 
-            // Restore viewport
             GL11.glViewport(prevViewportX, prevViewportY, prevViewportWidth, prevViewportHeight);
 
-            // Restore blend state
             GL14.glBlendFuncSeparate(prevBlendSrcRgb, prevBlendDstRgb, prevBlendSrcAlpha, prevBlendDstAlpha);
             GL20.glBlendEquationSeparate(prevBlendEqRgb, prevBlendEqAlpha);
             if (blendEnabled) {
@@ -520,7 +668,6 @@ public class ShaderRenderer {
                 GL11.glDisable(GL11.GL_BLEND);
             }
 
-            // Restore depth state
             GL11.glDepthMask(depthMaskEnabled);
             if (depthTestEnabled) {
                 GL11.glEnable(GL11.GL_DEPTH_TEST);
@@ -528,24 +675,20 @@ public class ShaderRenderer {
                 GL11.glDisable(GL11.GL_DEPTH_TEST);
             }
 
-            // Restore cull face
             if (cullEnabled) {
                 GL11.glEnable(GL11.GL_CULL_FACE);
             } else {
                 GL11.glDisable(GL11.GL_CULL_FACE);
             }
 
-            // Restore colour mask
             GL11.glColorMask(prevColorMaskRed, prevColorMaskGreen, prevColorMaskBlue, prevColorMaskAlpha);
 
-            // Restore framebuffer sRGB state
             if (framebufferSrgbEnabled) {
                 GL11.glEnable(GL30.GL_FRAMEBUFFER_SRGB);
             } else {
                 GL11.glDisable(GL30.GL_FRAMEBUFFER_SRGB);
             }
 
-            // Restore scissor test and box
             GL11.glScissor(prevScissorX, prevScissorY, prevScissorWidth, prevScissorHeight);
             if (scissorEnabled) {
                 GL11.glEnable(GL11.GL_SCISSOR_TEST);
@@ -553,17 +696,16 @@ public class ShaderRenderer {
                 GL11.glDisable(GL11.GL_SCISSOR_TEST);
             }
 
-            // Restore texture state
             GL13.glActiveTexture(prevActiveTexture);
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTexture2D);
             GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, prevArrayBuffer);
 
-            // Restore shader program
             GL20.glUseProgram(prevProgram);
             GL30.glBindVertexArray(prevVAO);
             RenderSystem.restoreProjectionMatrix();
         }
     }
+
     private float resolvePanoramaSpeed() {
         if (!panoramaSpeedChecked) {
             panoramaSpeedChecked = true;
@@ -595,7 +737,6 @@ public class ShaderRenderer {
         return 1.0f;
     }
 
-
     private void cleanupShader() {
         if (fragmentShader != -1) {
             GL20.glDeleteShader(fragmentShader);
@@ -608,6 +749,14 @@ public class ShaderRenderer {
         if (shaderProgram != -1) {
             GL20.glDeleteProgram(shaderProgram);
             shaderProgram = -1;
+        }
+        if (bufferAProgram != -1) {
+            GL20.glDeleteProgram(bufferAProgram);
+            bufferAProgram = -1;
+        }
+        if (bufferBProgram != -1) {
+            GL20.glDeleteProgram(bufferBProgram);
+            bufferBProgram = -1;
         }
     }
 
@@ -627,6 +776,10 @@ public class ShaderRenderer {
         if (canvas != null) {
             canvas.close();
             canvas = null;
+        }
+        if (bufferChain != null) {
+            bufferChain.cleanup();
+            bufferChain = null;
         }
         glResourcesInitialized = false;
     }

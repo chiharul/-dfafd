@@ -11,13 +11,19 @@ import sh.tinywifi.canvasglsl.ide.ShaderEditorState;
 import sh.tinywifi.canvasglsl.ide.ShaderIDEController;
 import sh.tinywifi.canvasglsl.media.MediaEntry;
 import sh.tinywifi.canvasglsl.render.MediaRenderer;
+import sh.tinywifi.canvasglsl.shader.ShaderConfig;
+import sh.tinywifi.canvasglsl.shader.ShaderConfigWatcher;
 import sh.tinywifi.canvasglsl.shader.ShaderPresets;
 import sh.tinywifi.canvasglsl.shader.ShaderRenderer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import java.nio.file.Path;
 
 /**
  * Standalone background controller that swaps the main menu panorama with either static media or GLSL shaders.
+ * Supports Shadertoy-style multi-buffer shaders with configuration.
+ * Watches config folder for file changes and reloads automatically.
  */
 public class ShaderBackground implements ShaderChangeListener, MediaChangeListener {
     private final ShaderIDEController controller;
@@ -25,6 +31,9 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
     private ShaderRenderer renderer;
     private final MediaRenderer mediaRenderer;
     private MediaEntry pendingMediaEntry;
+
+    private ShaderConfig shaderConfig;
+    private ShaderConfigWatcher configWatcher;
 
     private long lastFpsDiagnosticMs = 0L;
 
@@ -51,15 +60,33 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
     public void initialize() {
         controller.addListener(this);
         controller.addMediaListener(this);
+
+        // Load shader configuration
+        Path configPath = controller.getWorkspace().getRoot().resolve("shaders");
+        System.out.println("[ShaderBackground] Workspace root: " + controller.getWorkspace().getRoot());
+        System.out.println("[ShaderBackground] Config path: " + configPath);
+        System.out.println("[ShaderBackground] Config path exists: " + Files.exists(configPath));
+
+        shaderConfig = new ShaderConfig(configPath);
+
+        // Start watching config folder for changes
+        configWatcher = new ShaderConfigWatcher(shaderConfig, configPath);
+        configWatcher.start();
+
         compileQueued = false;
         needsCompile = true;
-        logDiagnostic("Shader background initialized (enabled={})", enabled);
+        logDiagnostic("Shader background initialized (enabled={}, hasConfig={})", enabled, shaderConfig.hasValidConfig());
     }
 
     public void shutdown() {
         restoreFramerateOverride();
         destroyRenderer();
         mediaRenderer.unload();
+
+        // Stop watching config folder
+        if (configWatcher != null) {
+            configWatcher.stop();
+        }
     }
 
     public void setEnabled(boolean enabled) {
@@ -88,10 +115,16 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
         logDiagnostic("Shader saved to {}; queued for compile (autoCompile={})",
             file != null ? file.getFileName() : "<unsaved>", editorState.isAutoCompileEnabled());
 
+        // Update shader config with main shader
+        shaderConfig.setMainShader(source);
+        shaderConfig.reload(); // Reload from config directory if it exists
+
+        logDiagnostic("Shader saved; checking config (hasConfig={})", shaderConfig.hasValidConfig());
+
         // Don't compile immediately during initialization - let the render loop handle it
         // Only queue compile if we're already on the render thread (user manually saving)
         if (enabled && editorState.isAutoCompileEnabled() && RenderSystem.isOnRenderThread()) {
-            queueCompile(source);
+            queueCompile(shaderConfig.getActiveShader());
         }
     }
 
@@ -107,8 +140,8 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
         if (controller.getActiveContentType() != ShaderIDEController.ContentType.SHADER) {
             return;
         }
-        logDiagnostic("compileCurrentShader invoked (autoCompile={})", editorState.isAutoCompileEnabled());
-        queueCompile(controller.getCurrentSource());
+        logDiagnostic("compileCurrentShader invoked (hasConfig={})", shaderConfig.hasValidConfig());
+        queueCompile(shaderConfig.getActiveShader());
     }
 
     public void requestManualCompile() {
@@ -117,7 +150,7 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
             return;
         }
         logDiagnostic("Manual compile requested");
-        queueCompile(controller.getCurrentSource());
+        queueCompile(shaderConfig.getActiveShader());
     }
 
     private void queueCompile(String fragmentSource) {
@@ -159,12 +192,24 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
         String shaderCode = queuedSource;
         queuedSource = null;
 
+        System.out.println("[ShaderBackground] Flushing queued compile");
+        System.out.println("[ShaderBackground] shaderConfig.hasValidConfig() = " + shaderConfig.hasValidConfig());
+        System.out.println("[ShaderBackground] shaderConfig.getActiveShader() length = " + shaderConfig.getActiveShader().length());
+        System.out.println("[ShaderBackground] BufferA length = " + shaderConfig.getBufferA().length());
+        System.out.println("[ShaderBackground] BufferB length = " + shaderConfig.getBufferB().length());
+        System.out.println("[ShaderBackground] Image length = " + shaderConfig.getImageShader().length());
+
         if (shaderCode == null || shaderCode.isBlank()) {
             CanvasGLSL.LOG.warn("Current shader buffer empty; using TRIPPY preset as fallback");
             shaderCode = ShaderPresets.TRIPPY.getShaderCode();
         }
 
+        // Pass shader config to renderer
+        renderer.setShaderConfig(shaderConfig);
+
         boolean success = renderer.compileShader(shaderCode);
+
+        System.out.println("[ShaderBackground] Compile result: " + success);
 
         if (success) {
             needsCompile = false;
@@ -247,7 +292,7 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
         // Don't retry compilation if it already failed - wait for user to fix and reload
         if (needsCompile && !compilationFailed && editorState.isAutoCompileEnabled() && !compileQueued) {
             logDiagnostic("Auto-compiling shader during render pass");
-            queueCompile(controller.getCurrentSource());
+            queueCompile(shaderConfig.getActiveShader());
         } else if (needsCompile && !editorState.isAutoCompileEnabled()) {
             logDiagnostic("Shader requires manual compile; skipping render");
         } else if (compilationFailed) {
@@ -369,5 +414,3 @@ public class ShaderBackground implements ShaderChangeListener, MediaChangeListen
         framerateOverrideApplied = false;
     }
 }
-
-
