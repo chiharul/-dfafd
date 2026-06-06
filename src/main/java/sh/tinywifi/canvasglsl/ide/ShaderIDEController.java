@@ -4,8 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonSyntaxException;
 import sh.tinywifi.canvasglsl.CanvasGLSL;
-import sh.tinywifi.canvasglsl.gui.ShaderIDEScreen;
-import sh.tinywifi.canvasglsl.gui.ShaderIDEViewport;
+
 import sh.tinywifi.canvasglsl.media.MediaEntry;
 import sh.tinywifi.canvasglsl.media.MediaType;
 
@@ -31,7 +30,7 @@ public final class ShaderIDEController {
 
     private final ShaderWorkspace workspace = ShaderWorkspace.open();
     private final ShaderEditorState editorState = new ShaderEditorState(workspace);
-    private final ShaderIDEViewport viewport = new ShaderIDEViewport(this);
+
     private final List<ShaderChangeListener> listeners = new CopyOnWriteArrayList<>();
     private final List<MediaChangeListener> mediaListeners = new CopyOnWriteArrayList<>();
     private final Gson gson = new Gson();
@@ -57,9 +56,7 @@ public final class ShaderIDEController {
         return editorState;
     }
 
-    public ShaderIDEViewport getViewport() {
-        return viewport;
-    }
+
 
     public ContentType getActiveContentType() {
         return contentType;
@@ -76,7 +73,7 @@ public final class ShaderIDEController {
     public void setOverlayVisible(boolean visible) {
         overlayVisible = visible;
         if (visible) {
-            viewport.ensureReady();
+
         }
     }
 
@@ -84,9 +81,7 @@ public final class ShaderIDEController {
         return overlayVisible;
     }
 
-    public ShaderIDEScreen createScreen() {
-        return new ShaderIDEScreen(viewport);
-    }
+
 
     public void addListener(ShaderChangeListener listener) {
         if (listener != null && !listeners.contains(listener)) {

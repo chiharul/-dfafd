@@ -3,8 +3,6 @@
   "package": "sh.tinywifi.canvasglsl.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "MinecraftClientMixin",
-    "GameRendererMixin",
     "MouseMixin",
     "KeyboardMixin",
     "ScreenPanoramaMixin",
